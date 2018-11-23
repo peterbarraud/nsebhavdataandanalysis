@@ -1,4 +1,3 @@
 /.idea/
 /logs/
-/a/*
-!/a/b/
+mariadb.bhav/data/*
