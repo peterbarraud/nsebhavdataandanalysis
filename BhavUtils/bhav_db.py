@@ -1,3 +1,5 @@
+import glob
+from zipfile import ZipFile, ZIP_DEFLATED
 import pymysql
 import calendar
 from datetime import date, timedelta
@@ -5,6 +7,8 @@ import re
 from os import path
 import os
 
+class BadDatabaseFilesError(Exception):
+    pass
 
 class BadTimestampYearError(Exception):
     pass
@@ -12,7 +16,7 @@ class BadTimestampYearError(Exception):
 class BhavDB:
     def __init__(self):
         self.__connection = pymysql.connect(host='localhost', user='root', password='',
-                                     db='bhavdata', charset='utf8mb4', cursorclass=pymysql.cursors.DictCursor)
+                                     db='bhavdata1', charset='utf8mb4', cursorclass=pymysql.cursors.DictCursor)
         with self.__connection.cursor() as cursor:
             tables_sql = "SELECT table_name FROM information_schema.tables where table_schema = 'bhavdata';"
             cursor.execute(tables_sql)
@@ -51,8 +55,8 @@ class BhavDB:
     # only the most recent year table is effected.
     # previous year tables are completely historic data so they won't every change once that year is done
     # PRIMARY KEY: This is on the symbol, series and timestamp fields since this combination is unique
-    def __create_year_table(self, timestamp: str) -> str:
-        table_name = "bhavcopy_" + timestamp[-4:]
+    def create_year_table(self, year: int):
+        table_name = "bhavcopy_{}".format(year)
         create_table_sql = "CREATE table " + " if not exists " + table_name + "("
         create_table_sql += "symbol varchar(15),"
         create_table_sql += "series char(2),"
@@ -64,14 +68,14 @@ class BhavDB:
         create_table_sql += "prevclose DECIMAL(8,2),"
         create_table_sql += "tottrdqty int unsigned,"
         create_table_sql += "tottrdval bigint unsigned,"
-        if int(timestamp[-4:]) >= 2011:
+        if year >= 2011:
             create_table_sql += "totaltrades mediumint unsigned default null,"
             create_table_sql += "isin char(12) default null,"
         create_table_sql += "timestamp date,"
         create_table_sql += "primary key(symbol, series, timestamp)"
         create_table_sql += ");"
-
-        return create_table_sql
+        with self.__connection.cursor() as cursor:
+            cursor.execute(create_table_sql)
 
     def __del__(self):
         self.__connection.commit()
@@ -84,6 +88,23 @@ class BhavDB:
         month = str(self._month_dict[time_parts[1]]).zfill(2)
         day = str(time_parts[0]).zfill(2)
         return year + "-" + month + "-" + day
+
+    def discard_tablespace(self, year):
+        with self.__connection.cursor() as cursor:
+            try:
+                cursor.execute("alter table bhavcopy_{} discard tablespace;".format(year))
+                self.__connection.commit()
+            except pymysql.err.InternalError as int_err:
+                if str(int_err) == "(1932, \"Table 'bhavdata.bhavcopy_{}' doesn't exist in engine\")".format(year):
+                    raise BadDatabaseFilesError("Bad database files. The bhavdata database needs to be dropped and recreated. ")
+
+    def import_tablespace(self, year):
+        with self.__connection.cursor() as cursor:
+            cursor.execute("alter table bhavcopy_{} import tablespace;".format(year))
+
+    def recreate_bhavdata(self):
+        with self.__connection.cursor() as cursor:
+            cursor.execute("use mysql; drop database bhavdata; create database bhavdata; use bhavdata")
 
     def insert_bhav_row(self, row: dict, zip_file_name: str):
         bhavcopy_table = "bhavcopy_{}".format(row['TIMESTAMP'][-4:])
@@ -102,12 +123,12 @@ class BhavDB:
         with self.__connection.cursor() as cursor:
             try:
                 if bhavcopy_table not in self._bhavcopy_tables:
-                    create_table_sql = self.__create_year_table(row['TIMESTAMP'])
-                    cursor.execute(create_table_sql)
+                    self.create_year_table(row['TIMESTAMP'])
                     self._bhavcopy_tables.append(bhavcopy_table)
                 cursor.execute(sql_insert)
             except pymysql.err.IntegrityError as integrity_err:
-                # IMPORTANT: Rather than check, we're just going to let the db fail on duplicates and then not log the duplicate error
+                # IMPORTANT: Rather than check, we're just going to let the db fail on duplicates
+                # and then not log the duplicate error
                 if "(1062, \"Duplicate entry '" + row['SYMBOL'] + "-" + row['SERIES'] + "-" + self._get_mysql_date(row['TIMESTAMP']) + "\' for key 'PRIMARY'\")" in str(integrity_err):
                     pass
                 else:
@@ -125,9 +146,22 @@ class BhavDB:
             cursor.execute(tables_sql)
             result = cursor.fetchall()
             first_year = min([int(re.search('\d{4}$', x['table_name']).group()) for x in result])
-            print(result)
+        return first_year
 
-        return None
+    def prepare_data_for_git(self):
+        ibd_files:list = glob.glob('mariadb.bhav/data/bhavdata1/*.ibd')
+        if not os.path.exists("mariadb.bhav/ibd.zip"):
+            os.mkdir("mariadb.bhav/ibd.zip")
+        ibd_file: str
+        for ibd_file in ibd_files:
+            print("Doing {}".format(os.path.basename(ibd_file).replace(".ibd", "")))
+            frm_file = ibd_file.replace(".ibd", ".frm")
+            with ZipFile("mariadb.bhav/ibd.zip/{}.zip".format(os.path.basename(ibd_file)), 'w', ZIP_DEFLATED) as ibd_zip:
+                ibd_zip.write(ibd_file, os.path.basename(ibd_file))
+                ibd_zip.write(frm_file, os.path.basename(frm_file))
+
+    def get_data_of_git(self):
+        pass
 
 
 # this is a package class but we've got the main function in here only for testing purposes
